@@ -419,6 +419,7 @@ button.pk-go{margin-top:0;margin-left:auto;padding:4px 12px;font-size:12.5px;
       </div>
       <label class="chk"><input type="checkbox" id="pkFired"> 只看已站上 40 日线</label>
       <label class="chk"><input type="checkbox" id="pkBand"> 只看止损距离 4%–15%（可用区间）</label>
+      <label class="chk"><input type="checkbox" id="pkChase"> 只看追价后仍够 1.5R 的（不含已跑远的）</label>
       <button type="button" class="act" id="pkRefresh">刷新最新价（需联网）</button>
       <div class="rc hidden" id="rfBox">
         <div class="rc-bar"><i id="rfFill"></i></div>
@@ -426,7 +427,7 @@ button.pk-go{margin-top:0;margin-left:auto;padding:4px 12px;font-size:12.5px;
         <p class="rc-msg" id="rfMsg">—</p>
       </div>
       <button type="button" class="act" id="pkRecalc">重算候选池（需联网）</button>
-      <p class="staticnote" id="pkNote">名单为收盘快照。点任意一只看它的 K 线形态，点「算仓位」带到计算页。</p>
+      <p class="staticnote" id="pkNote">名单为收盘快照。点任意一只看它的 K 线，点「算仓位」带到计算页。止盈锚定在「40 日线 + 2R」的原计划上；已站上 40 日线的会标出追价后还剩几个 R。</p>
 
       <div class="rc hidden" id="rcBox">
         <div class="rc-bar"><i id="rcFill"></i></div>
@@ -766,7 +767,7 @@ var SNAP = window.__SCREEN__ || null;
 var UNI = window.__UNIVERSE__ || null;
 var MAIDX = window.__MAIDX__ || null;
 var PKF = ["code", "name", "price", "chg", "trigger", "stop", "pb"];
-var PK = {sort: "dist", onlyFired: false, onlyBand: false, q: "", quotes: {}, loaded: false};
+var PK = {sort: "dist", onlyFired: false, onlyBand: false, onlyChase: false, q: "", quotes: {}, loaded: false};
 /* 当前名单。初值是内嵌快照，点「重算候选池」后会被整体替换。 */
 var ROWS = [];
 var ASOF = "";
@@ -808,9 +809,17 @@ function pkRows(){
        还没站上的按 40 日线（触发价）买。风险必须从这里算，不能从触发价算，
        否则已站上的股票会把真实止损距离算小。 */
     o.entry = o.fired ? o.price : o.trigger;
-    o.target = o.entry + 2 * (o.entry - o.stop);
+    /* 止盈锚定在「原计划」上：入场价×（触发价 + 2×原风险），**不随追价漂移**。
+       追价买进去之后，同一个止盈离你更近、而你的风险更大，实际拿不到 2R ——
+       realR 就是把这层损耗算出来的数：(原止盈 − 现价) ÷ (现价 − 止损)。 */
+    o.target = o.trigger + 2 * (o.trigger - o.stop);
     o.dist = o.entry > 0 ? (o.entry - o.stop) / o.entry * 100 : 0;
     o.gap = o.trigger > 0 ? Math.abs(o.price - o.trigger) / o.trigger * 100 : 0;
+    o.chase = (o.fired && o.trigger - o.stop > 0)
+            ? (o.price - o.trigger) / (o.trigger - o.stop) : 0;
+    o.realR = o.fired
+            ? ((o.price - o.stop) > 0 ? (o.target - o.price) / (o.price - o.stop) : 0)
+            : 2;
     out.push(o);
   }
   return out;
@@ -832,6 +841,7 @@ function pkFiltered(all){
     var o = all[i];
     if (PK.onlyFired && !o.fired){ continue; }
     if (PK.onlyBand && (o.dist < 4 || o.dist > 15)){ continue; }
+    if (PK.onlyChase && o.fired && o.realR < 1.5){ continue; }
     if (q && o.code.indexOf(q) < 0 &&
         String(o.name).toLowerCase().indexOf(q) < 0){ continue; }
     r.push(o);
@@ -850,12 +860,18 @@ function pkRender(){
     return;
   }
   var all = pkRows(), list = pkFiltered(all);
-  var fired = 0;
-  for (var i = 0; i < all.length; i++){ if (all[i].fired){ fired++; } }
+  var fired = 0, thin = 0;
+  for (var i = 0; i < all.length; i++){
+    if (all[i].fired){
+      fired++;
+      if (all[i].realR < 1.5){ thin++; }
+    }
+  }
   var eq = num($("equity").value), rk = num($("risk").value), cp = num($("cap").value);
   var asof = fmtAsOf(ASOF);
   $("pkCount").textContent = list.length + " / " + all.length + " 只";
-  $("pkAsOf").textContent = asof + " · 已站上 40 日线 " + fired + " 只";
+  $("pkAsOf").textContent = asof + " · 站上 40 线 " + fired + " 只" +
+    (fired ? "（" + thin + " 只不足 1.5R）" : "");
 
   var h = [];
   for (var k = 0; k < list.length; k++){
@@ -863,6 +879,12 @@ function pkRender(){
     var r = computePosition({equity: eq, riskPct: rk, capPct: cp,
                              stopDistPct: o.dist, price: o.entry});
     var band = (o.dist >= 4 && o.dist <= 15);
+    var rcls = !o.fired ? "" : (o.realR >= 1.5 ? "b-ok" : (o.realR >= 1 ? "b-warn" : "b-bad"));
+    var rtxt = !o.fired ? "等待" : ("追价剩 " + (o.realR > 0 ? o.realR.toFixed(2) : "0.00") + "R");
+    var rtip = !o.fired ? "还没站上 40 日线，触发价买进是足额 2R"
+      : ("已站上 40 日线 " + o.gap.toFixed(1) + "%，现价买入吃掉 " + o.chase.toFixed(2) +
+         " 倍原风险；原计划止盈 " + o.target.toFixed(2) + " 只剩 " + o.realR.toFixed(2) +
+         "R。想要足额 2R 得等回到 " + o.trigger.toFixed(2) + " 附近。");
     var cls = o.chg > 0 ? "up" : (o.chg < 0 ? "dn" : "flat");
     h.push('<div class="pk" data-code="' + esc(o.code) + '">' +
       '<div class="pk-t"><b>' + esc(o.name) + '</b>' +
@@ -878,8 +900,7 @@ function pkRender(){
       '<div class="pk-f">' +
         '<span class="badge ' + (band ? "b-pri" : "b-warn") + '">距 ' +
           o.dist.toFixed(1) + '%</span>' +
-        '<span class="badge ' + (o.fired ? "b-ok" : "") + '">' +
-          (o.fired ? "已触发" : "等待") + '</span>' +
+        '<span class="badge ' + rcls + '" title="' + esc(rtip) + '">' + rtxt + '</span>' +
         '<span>仓位 <b>' + yuan(r.pos) + '</b> 元</span>' +
         '<span><b>' + yuan(r.shares) + '</b> 股</span>' +
         '<button type="button" class="mini pk-go" data-code="' + esc(o.code) +
@@ -1095,9 +1116,14 @@ function kbDraw(o, bars){
       (isFinite(pct) ? pct.toFixed(2) : "—") + '%）</span>' +
     '<span>止盈 <b>' + o.target.toFixed(2) + '</b></span>' +
     '<span>回调 <b>' + yuan(o.pb) + '</b> 日</span>' +
+    (o.fired ? '<span>追价剩 <b>' + (o.realR > 0 ? o.realR.toFixed(2) : "0.00") +
+               'R</b></span>' : '') +
     (clipped ? '<span>（止盈在视野上方）</span>' : '');
   kbNote("最近 " + cnt + " 个交易日，前复权。浅色底 = 10 日线下穿 40 日线以来的回调区间；" +
-         "横虚线是按快照算出的买入 / 止损 / 止盈。点「用这只算仓位」可带到计算页。");
+         "横虚线是按快照算出的买入 / 止损 / 止盈。" +
+         (o.fired ? " 止盈锚在「原计划」（40 日线 " + o.trigger.toFixed(2) + " + 2R），" +
+                    "不随追价上移 —— 现在买进去只剩 " + o.realR.toFixed(2) + "R。" : "") +
+         " 点「用这只算仓位」可带到计算页。");
 }
 
 /* 用 <script> 拉腾讯批量快照：能绕开 CORS，file:// 下也能用 */
@@ -1556,6 +1582,7 @@ function pkBind(){
   $("pkSearch").addEventListener("input", function(){ PK.q = this.value; pkRender(); });
   $("pkFired").addEventListener("change", function(){ PK.onlyFired = this.checked; pkRender(); });
   $("pkBand").addEventListener("change", function(){ PK.onlyBand = this.checked; pkRender(); });
+  $("pkChase").addEventListener("change", function(){ PK.onlyChase = this.checked; pkRender(); });
   $("pkRefresh").addEventListener("click", pkRefresh);
   $("pkRecalc").addEventListener("click", pkRecalc);
   $("rcCancel").addEventListener("click", rcCancelClick);
